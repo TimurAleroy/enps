@@ -85,7 +85,7 @@ async def check_reviews():
         processed_rows.add(row_id)
         worst_score, worst_cat = find_worst_score(cols)
 
-        if worst_score < 7:
+        if worst_score < 7 and comment:
             comment = cols[7].strip() if len(cols) > 7 else ""
             scores_text = (
                 f"😊 Вечер: {cols[1]}/10\n"
