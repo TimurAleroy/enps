@@ -1,8 +1,10 @@
 import os
+import asyncio
 import requests
-from datetime import datetime, date
-from telegram import Update, ReplyKeyboardRemove
+from datetime import date
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
@@ -18,8 +20,9 @@ NOTION_HEADERS = {
 }
 
 processed_rows = set()
+bot_app = None
 
-# ─── CSI/NPS ───────────────────────────────────────────────
+# ─── CSI/NPS ─────────────────────────────────────────
 
 def get_csi_rows():
     url = f"https://docs.google.com/spreadsheets/d/{CSI_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
@@ -70,7 +73,10 @@ def create_notion_problem(cols, worst_score, worst_cat):
     res = requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_data)
     return res.status_code == 200
 
-async def check_reviews(context):
+async def check_reviews():
+    global bot_app
+    if not bot_app:
+        return
     rows = get_csi_rows()
     for cols in rows:
         row_id = cols[0]
@@ -89,20 +95,16 @@ async def check_reviews(context):
                 f"👨‍💼 Команда: {cols[5]}/10\n"
                 f"🎯 NPS: {cols[6]}/10"
             )
-            text = (
-                f"🚨 *Негативный отзыв гостя!*\n\n"
-                f"{scores_text}\n"
-                f"👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
-            )
+            text = f"🚨 *Негативный отзыв гостя!*\n\n{scores_text}\n👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
             if comment:
                 text += f"💬 _{comment}_\n"
 
             created = create_notion_problem(cols, worst_score, worst_cat)
-            text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу в Notion."
+            text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу."
 
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+            await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
 
-# ─── eNPS ───────────────────────────────────────────────────
+# ─── eNPS ────────────────────────────────────────────
 
 def get_enps_data():
     url = f"https://docs.google.com/spreadsheets/d/{ENPS_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=enps"
@@ -118,7 +120,6 @@ def get_enps_data():
         cols = [c.strip().strip('"') for c in line.split(",")]
         if len(cols) >= 2 and cols[1]:
             rows.append(cols)
-
     if not rows:
         return None
 
@@ -129,7 +130,6 @@ def get_enps_data():
 
     promoters = neutrals = critics = 0
     likes, improvements = [], []
-
     for r in use_rows:
         try:
             score = float(r[1].replace(",", "."))
@@ -171,12 +171,12 @@ def get_enps_data():
         "period": "этот месяц" if month_rows else "всё время"
     }
 
-# ─── КОМАНДЫ ────────────────────────────────────────────────
+# ─── КОМАНДЫ ─────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👨‍💼 *Бот администратора*\n\n"
-        "🔔 Уведомляю о негативных отзывах гостей автоматически каждый час.\n\n"
+        "🔔 Уведомляю о негативных отзывах каждый час.\n\n"
         "/enps — eNPS сотрудников\n"
         "/problems — открытые проблемы",
         parse_mode="Markdown"
@@ -236,23 +236,29 @@ async def problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"⚠️ *Открытые проблемы ({len(results)}):*\n\n"
     for p in results:
         props = p["properties"]
-        title = props["Проблема"]["title"][0]["plain_text"] if props["Проблема"]["title"] else "—"
-        status = props["Статус"]["select"]["name"] if props["Статус"]["select"] else "—"
         category = props["Категория"]["select"]["name"] if props["Категория"]["select"] else "—"
         score = props["Оценка гостя"]["number"] if props["Оценка гостя"]["number"] else "—"
+        status = props["Статус"]["select"]["name"] if props["Статус"]["select"] else "—"
         deadline = props["Срок исполнения"]["date"]["start"] if props["Срок исполнения"]["date"] else "не указан"
         responsible = props["Ответственный"]["rich_text"][0]["plain_text"] if props["Ответственный"]["rich_text"] else "не назначен"
         status_icon = "🔴" if status == "Новая" else "🟡"
-        text += (
-            f"{status_icon} *{category}* — {score}/10\n"
-            f"   👤 {responsible} · 📅 {deadline}\n\n"
-        )
+        text += f"{status_icon} *{category}* — {score}/10\n   👤 {responsible} · 📅 {deadline}\n\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+# ─── ЗАПУСК ──────────────────────────────────────────
+
+async def post_init(application):
+    global bot_app
+    bot_app = application
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_reviews, "interval", hours=1, id="check_reviews")
+    scheduler.start()
+    # Первая проверка сразу при старте
+    await check_reviews()
+
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("enps", enps))
 app.add_handler(CommandHandler("problems", problems))
-app.job_queue.run_repeating(check_reviews, interval=3600, first=10)
 app.run_polling()
