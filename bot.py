@@ -12,6 +12,7 @@ NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
 ADMIN_CHAT_ID = 188483198
 ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
+PROCESSED_FILE = "/app/processed_rows.txt"
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -19,8 +20,19 @@ NOTION_HEADERS = {
     "Content-Type": "application/json"
 }
 
-processed_rows = set()
 bot_app = None
+
+def load_processed():
+    if os.path.exists(PROCESSED_FILE):
+        with open(PROCESSED_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def save_processed(row_id):
+    with open(PROCESSED_FILE, "a") as f:
+        f.write(row_id + "\n")
+
+processed_rows = load_processed()
 
 # ─── CSI/NPS ─────────────────────────────────────────
 
@@ -49,8 +61,7 @@ def find_worst_score(cols):
             pass
     return worst_score, worst_cat
 
-def create_notion_problem(cols, worst_score, worst_cat):
-    comment = cols[7].strip() if len(cols) > 7 else ""
+def create_notion_problem(cols, worst_score, worst_cat, comment):
     visit_date = cols[0].split(" ")[0] if cols[0] else date.today().isoformat()
     try:
         parts = visit_date.split(".")
@@ -65,7 +76,7 @@ def create_notion_problem(cols, worst_score, worst_cat):
             "Проблема": {"title": [{"text": {"content": f"Низкая оценка — {worst_cat} ({worst_score}/10)"}}]},
             "Категория": {"select": {"name": worst_cat}},
             "Оценка гостя": {"number": worst_score},
-            "Комментарий гостя": {"rich_text": [{"text": {"content": comment or "Без комментария"}}]},
+            "Комментарий гостя": {"rich_text": [{"text": {"content": comment}}]},
             "Дата отзыва": {"date": {"start": visit_date}},
             "Статус": {"select": {"name": "Новая"}}
         }
@@ -74,18 +85,23 @@ def create_notion_problem(cols, worst_score, worst_cat):
     return res.status_code == 200
 
 async def check_reviews():
-    global bot_app
+    global bot_app, processed_rows
     if not bot_app:
         return
+
     rows = get_csi_rows()
     for cols in rows:
-        row_id = cols[0]
+        row_id = cols[0]  # временная метка как уникальный ключ
         if row_id in processed_rows:
             continue
+
+        # Сразу сохраняем чтобы не дублировать даже если нет негатива
         processed_rows.add(row_id)
-        worst_score, worst_cat = find_worst_score(cols)
+        save_processed(row_id)
 
         comment = cols[7].strip() if len(cols) > 7 else ""
+        worst_score, worst_cat = find_worst_score(cols)
+
         if worst_score < 7 and comment:
             scores_text = (
                 f"😊 Вечер: {cols[1]}/10\n"
@@ -95,11 +111,13 @@ async def check_reviews():
                 f"👨‍💼 Команда: {cols[5]}/10\n"
                 f"🎯 NPS: {cols[6]}/10"
             )
-            text = f"🚨 *Негативный отзыв гостя!*\n\n{scores_text}\n👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
-            if comment:
-                text += f"💬 _{comment}_\n"
-
-            created = create_notion_problem(cols, worst_score, worst_cat)
+            text = (
+                f"🚨 *Негативный отзыв гостя!*\n\n"
+                f"{scores_text}\n"
+                f"👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
+                f"💬 _{comment}_\n"
+            )
+            created = create_notion_problem(cols, worst_score, worst_cat, comment)
             text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу."
 
             await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
@@ -176,7 +194,7 @@ def get_enps_data():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👨‍💼 *Бот администратора*\n\n"
-        "🔔 Уведомляю о негативных отзывах каждый час.\n\n"
+        "🔔 Уведомляю о негативных отзывах с замечаниями каждый час.\n\n"
         "/enps — eNPS сотрудников\n"
         "/problems — открытые проблемы",
         parse_mode="Markdown"
@@ -254,7 +272,6 @@ async def post_init(application):
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_reviews, "interval", hours=1, id="check_reviews")
     scheduler.start()
-    # Первая проверка сразу при старте
     await check_reviews()
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
