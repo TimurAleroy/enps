@@ -12,7 +12,6 @@ NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
 ADMIN_CHAT_ID = 188483198
 ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
-PROCESSED_FILE = "/app/processed_rows.txt"
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -22,19 +21,23 @@ NOTION_HEADERS = {
 
 bot_app = None
 
-def load_processed():
-    if os.path.exists(PROCESSED_FILE):
-        with open(PROCESSED_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
-    return set()
-
-def save_processed(row_id):
-    with open(PROCESSED_FILE, "a") as f:
-        f.write(row_id + "\n")
-
-processed_rows = load_processed()
-
-# ─── CSI/NPS ─────────────────────────────────────────
+def get_processed_from_notion():
+    """Читает уже обработанные отзывы из Notion по полю Дата отзыва + Комментарий"""
+    res = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_PROBLEMS_DB_ID}/query",
+        headers=NOTION_HEADERS,
+        json={"page_size": 100}
+    )
+    results = res.json().get("results", [])
+    processed = set()
+    for p in results:
+        props = p["properties"]
+        comment = props.get("Комментарий гостя", {}).get("rich_text", [])
+        date_val = props.get("Дата отзыва", {}).get("date")
+        if comment and date_val:
+            key = f"{date_val['start']}_{comment[0]['plain_text']}"
+            processed.add(key)
+    return processed
 
 def get_csi_rows():
     url = f"https://docs.google.com/spreadsheets/d/{CSI_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
@@ -61,15 +64,7 @@ def find_worst_score(cols):
             pass
     return worst_score, worst_cat
 
-def create_notion_problem(cols, worst_score, worst_cat, comment):
-    visit_date = cols[0].split(" ")[0] if cols[0] else date.today().isoformat()
-    try:
-        parts = visit_date.split(".")
-        if len(parts) == 3:
-            visit_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
-    except:
-        visit_date = date.today().isoformat()
-
+def create_notion_problem(cols, worst_score, worst_cat, comment, visit_date):
     page_data = {
         "parent": {"database_id": NOTION_PROBLEMS_DB_ID},
         "properties": {
@@ -85,42 +80,55 @@ def create_notion_problem(cols, worst_score, worst_cat, comment):
     return res.status_code == 200
 
 async def check_reviews():
-    global bot_app, processed_rows
+    global bot_app
     if not bot_app:
         return
 
+    # Каждый раз читаем из Notion что уже обработано
+    processed = get_processed_from_notion()
     rows = get_csi_rows()
+
     for cols in rows:
-        row_id = cols[0]  # временная метка как уникальный ключ
-        if row_id in processed_rows:
+        comment = cols[7].strip() if len(cols) > 7 else ""
+        if not comment:
             continue
 
-        # Сразу сохраняем чтобы не дублировать даже если нет негатива
-        processed_rows.add(row_id)
-        save_processed(row_id)
-
-        comment = cols[7].strip() if len(cols) > 7 else ""
         worst_score, worst_cat = find_worst_score(cols)
+        if worst_score >= 7:
+            continue
 
-        if worst_score < 7 and comment:
-            scores_text = (
-                f"😊 Вечер: {cols[1]}/10\n"
-                f"🪄 Кальян: {cols[2]}/10\n"
-                f"🍹 Напитки: {cols[3]}/10\n"
-                f"🍽 Еда: {cols[4]}/10\n"
-                f"👨‍💼 Команда: {cols[5]}/10\n"
-                f"🎯 NPS: {cols[6]}/10"
-            )
-            text = (
-                f"🚨 *Негативный отзыв гостя!*\n\n"
-                f"{scores_text}\n"
-                f"👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
-                f"💬 _{comment}_\n"
-            )
-            created = create_notion_problem(cols, worst_score, worst_cat, comment)
-            text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу."
+        # Формируем уникальный ключ
+        visit_date_raw = cols[0].split(" ")[0] if cols[0] else ""
+        try:
+            parts = visit_date_raw.split(".")
+            visit_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}" if len(parts) == 3 else date.today().isoformat()
+        except:
+            visit_date = date.today().isoformat()
 
-            await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+        key = f"{visit_date}_{comment}"
+        if key in processed:
+            continue
+
+        # Создаём задачу в Notion
+        created = create_notion_problem(cols, worst_score, worst_cat, comment, visit_date)
+
+        scores_text = (
+            f"😊 Вечер: {cols[1]}/10\n"
+            f"🪄 Кальян: {cols[2]}/10\n"
+            f"🍹 Напитки: {cols[3]}/10\n"
+            f"🍽 Еда: {cols[4]}/10\n"
+            f"👨‍💼 Команда: {cols[5]}/10\n"
+            f"🎯 NPS: {cols[6]}/10"
+        )
+        text = (
+            f"🚨 *Негативный отзыв гостя!*\n\n"
+            f"{scores_text}\n"
+            f"👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
+            f"💬 _{comment}_\n"
+        )
+        text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу."
+
+        await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
 
 # ─── eNPS ────────────────────────────────────────────
 
