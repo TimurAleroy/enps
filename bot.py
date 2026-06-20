@@ -9,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
+NOTION_GUESTS_DB_ID = "35173a7166368022bf60d76141cca681"
 ADMIN_CHAT_ID = 188483198
 ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
@@ -202,9 +203,11 @@ def get_enps_data():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👨‍💼 *Бот администратора*\n\n"
-        "🔔 Уведомляю о негативных отзывах с замечаниями каждый час.\n\n"
+        "🔔 Уведомляю о негативных отзывах с замечаниями каждый час.\n"
+        "🎂 Каждое утро в 9:00 присылаю именинников.\n\n"
         "/enps — eNPS сотрудников\n"
-        "/problems — открытые проблемы",
+        "/problems — открытые проблемы\n"
+        "/birthdays — именинники сегодня",
         parse_mode="Markdown"
     )
 
@@ -272,13 +275,61 @@ async def problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ─── ЗАПУСК ──────────────────────────────────────────
+# ─── ДНИ РОЖДЕНИЯ ────────────────────────────────────
+
+def get_todays_birthdays():
+    """Находит гостей у которых сегодня день рождения"""
+    res = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_GUESTS_DB_ID}/query",
+        headers=NOTION_HEADERS,
+        json={"page_size": 100}
+    )
+    results = res.json().get("results", [])
+    today_md = date.today().strftime("%m-%d")
+
+    birthdays = []
+    for g in results:
+        props = g["properties"]
+        bday = props.get("Дата рождения", {}).get("date")
+        if bday and bday.get("start"):
+            bday_md = bday["start"][5:10]  # MM-DD
+            if bday_md == today_md:
+                name_title = props.get("Имя Гостя", {}).get("title", [])
+                name = name_title[0]["plain_text"] if name_title else "Без имени"
+                phone = props.get("Телефон", {}).get("phone_number") or "не указан"
+                birthdays.append({"name": name, "phone": phone})
+    return birthdays
+
+async def check_birthdays():
+    global bot_app
+    if not bot_app:
+        return
+    birthdays = get_todays_birthdays()
+    if birthdays:
+        text = "🎂 *Сегодня день рождения у гостей:*\n\n"
+        for b in birthdays:
+            text += f"👤 {b['name']} — 📱 {b['phone']}\n"
+        text += "\n💝 Не забудьте поздравить и предложить именинную скидку!"
+        await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+
+async def birthdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    birthdays = get_todays_birthdays()
+    if not birthdays:
+        await update.message.reply_text("🎂 Сегодня именинников нет.")
+        return
+    text = "🎂 *Сегодня день рождения у гостей:*\n\n"
+    for b in birthdays:
+        text += f"👤 {b['name']} — 📱 {b['phone']}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 
 async def post_init(application):
     global bot_app
     bot_app = application
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_reviews, "interval", hours=1, id="check_reviews")
+    scheduler.add_job(check_birthdays, "cron", hour=9, minute=0, id="check_birthdays")
     scheduler.start()
     await check_reviews()
 
@@ -286,4 +337,5 @@ app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("enps", enps))
 app.add_handler(CommandHandler("problems", problems))
+app.add_handler(CommandHandler("birthdays", birthdays_cmd))
 app.run_polling()
