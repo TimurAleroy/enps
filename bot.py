@@ -1,6 +1,7 @@
 import os
 import asyncio
 import requests
+from collections import Counter
 from datetime import date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -10,6 +11,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
 NOTION_GUESTS_DB_ID = "35173a7166368022bf60d76141cca681"
+NOTION_VISITS_DB_ID = "f384e676a0d7477bb45a34707bcb0dff"
 ADMIN_CHAT_ID = 188483198
 ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
@@ -21,6 +23,72 @@ NOTION_HEADERS = {
 }
 
 bot_app = None
+
+def query_all(db_id, body=None):
+    if body is None:
+        body = {}
+    results = []
+    payload = {**body, "page_size": 100}
+    while True:
+        res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=NOTION_HEADERS, json=payload).json()
+        results.extend(res.get("results", []))
+        if not res.get("has_more"):
+            break
+        payload["start_cursor"] = res["next_cursor"]
+    return results
+
+def get_csi_nps_data():
+    url = f"https://docs.google.com/spreadsheets/d/{CSI_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
+    res = requests.get(url)
+    if res.status_code != 200:
+        return None
+    lines = res.text.strip().split("\n")
+    if len(lines) < 2:
+        return None
+    rows = []
+    for line in lines[1:]:
+        cols = line.replace('"', '').split(",")
+        if len(cols) >= 7:
+            rows.append(cols)
+    if not rows:
+        return None
+    this_month = date.today().strftime("%m.%Y")
+    month_rows = [r for r in rows if r[0].endswith(this_month[:2] + "." + this_month[3:])]
+    use_rows = month_rows if month_rows else rows
+    total = len(use_rows)
+    if total == 0:
+        return None
+
+    def avg(col_idx):
+        vals = []
+        for r in use_rows:
+            try:
+                vals.append(float(r[col_idx].strip().replace(",", ".")))
+            except:
+                pass
+        return round(sum(vals) / len(vals), 1) if vals else 0
+
+    promoters = neutrals = critics = 0
+    for r in use_rows:
+        try:
+            score = float(r[6].strip().replace(",", "."))
+            if score >= 9: promoters += 1
+            elif score >= 7: neutrals += 1
+            else: critics += 1
+        except:
+            pass
+    nps = round(((promoters - critics) / total) * 100) if total > 0 else 0
+
+    comments = []
+    for r in use_rows:
+        if len(r) > 7 and r[7].strip():
+            comments.append(r[7].strip())
+
+    return {
+        "total": total, "mood": avg(1), "hookah": avg(2), "drinks": avg(3), "food": avg(4), "team": avg(5),
+        "nps": nps, "promoters": promoters, "neutrals": neutrals, "critics": critics,
+        "comments": comments[-3:], "period": "этот месяц" if month_rows else "всё время"
+    }
 
 def get_processed_from_notion():
     """Читает уже обработанные отзывы из Notion по полю Дата отзыва + Комментарий"""
@@ -322,7 +390,89 @@ async def birthdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"👤 {b['name']} — 📱 {b['phone']}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Собираю статистику...")
 
+    all_visits = query_all(NOTION_VISITS_DB_ID)
+    all_guests = query_all(NOTION_GUESTS_DB_ID)
+
+    this_month = date.today().strftime("%Y-%m")
+    month_visits = []
+    guest_visit_count = Counter()
+    hookah_counter = Counter()
+    drinks_counter = Counter()
+
+    for v in all_visits:
+        vp = v["properties"]
+        d = vp.get("Дата", {}).get("date")
+        visit_date = d["start"] if d else ""
+        if visit_date.startswith(this_month):
+            month_visits.append(v)
+        relations = vp.get("Гость", {}).get("relation", [])
+        if relations:
+            guest_visit_count[relations[0]["id"]] += 1
+        hookah_items = vp.get("Кальян", {}).get("rich_text", [])
+        if hookah_items:
+            h = hookah_items[0]["plain_text"].strip()
+            if h and h != "—":
+                hookah_counter[h] += 1
+        drinks_items = vp.get("Напитки", {}).get("rich_text", [])
+        if drinks_items:
+            dr = drinks_items[0]["plain_text"].strip()
+            if dr and dr != "—":
+                drinks_counter[dr] += 1
+
+    guest_names = {}
+    for g in all_guests:
+        title = g["properties"].get("Имя Гостя", {}).get("title", [])
+        if title:
+            guest_names[g["id"]] = title[0]["plain_text"]
+
+    new_guests_month = sum(1 for g in all_guests if g.get("created_time", "").startswith(this_month))
+
+    top_guests_text = ""
+    for i, (gid, count) in enumerate(guest_visit_count.most_common(5), 1):
+        top_guests_text += f"  {i}. {guest_names.get(gid, '?')} — {count} визитов\n"
+
+    top_hookah_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(hookah_counter.most_common(3), 1))
+    top_drinks_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(drinks_counter.most_common(3), 1))
+
+    text = (
+        f"📊 *Статистика заведения*\n"
+        f"_{date.today().strftime('%B %Y')}_\n\n"
+        f"📅 Визитов в этом месяце: *{len(month_visits)}*\n"
+        f"🆕 Новых гостей: *{new_guests_month}*\n"
+        f"👥 Всего гостей в базе: *{len(all_guests)}*\n\n"
+        f"🏆 *Топ гостей по визитам:*\n{top_guests_text or '  Нет данных'}\n"
+        f"🪄 *Популярный кальян:*\n{top_hookah_text or '  Нет данных'}\n"
+        f"🍹 *Популярные напитки:*\n{top_drinks_text or '  Нет данных'}"
+    )
+
+    csi = get_csi_nps_data()
+    if csi:
+        def bar(score):
+            filled = int(score / 2)
+            return "🟩" * filled + "⬜" * (5 - filled)
+
+        text += f"\n\n━━━━━━━━━━━━━━\n"
+        text += f"⭐ *CSI / NPS — {csi['period']}* ({csi['total']} отзывов)\n\n"
+        text += f"😊 Вечер в целом: *{csi['mood']}/10* {bar(csi['mood'])}\n"
+        text += f"🪄 Кальян: *{csi['hookah']}/10* {bar(csi['hookah'])}\n"
+        text += f"🍹 Напитки: *{csi['drinks']}/10* {bar(csi['drinks'])}\n"
+        text += f"🍽 Еда: *{csi['food']}/10* {bar(csi['food'])}\n"
+        text += f"👨‍💼 Команда: *{csi['team']}/10* {bar(csi['team'])}\n\n"
+        text += f"🎯 *NPS: {csi['nps']}*\n"
+        text += f"  👍 Промоутеры: {csi['promoters']}\n"
+        text += f"  😐 Нейтралы: {csi['neutrals']}\n"
+        text += f"  👎 Критики: {csi['critics']}\n"
+        if csi['comments']:
+            text += f"\n💬 *Последние отзывы:*\n"
+            for c in csi['comments']:
+                text += f"  • {c}\n"
+    else:
+        text += "\n\n⭐ *CSI/NPS:* нет данных"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def post_init(application):
     global bot_app
@@ -338,4 +488,5 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("enps", enps))
 app.add_handler(CommandHandler("problems", problems))
 app.add_handler(CommandHandler("birthdays", birthdays_cmd))
+app.add_handler(CommandHandler("stats", stats))
 app.run_polling()
