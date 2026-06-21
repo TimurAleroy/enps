@@ -3,8 +3,11 @@ import asyncio
 import requests
 from collections import Counter
 from datetime import date
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -12,6 +15,7 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
 NOTION_GUESTS_DB_ID = "35173a7166368022bf60d76141cca681"
 NOTION_VISITS_DB_ID = "f384e676a0d7477bb45a34707bcb0dff"
+NOTION_EVENTS_DB_ID = "35173a71663680999ebcf882ecea022d"
 ADMIN_CHAT_ID = 188483198
 ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
@@ -474,6 +478,107 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# ─── МЕРОПРИЯТИЯ ──────────────────────────────────────
+
+EVENT_NAME, EVENT_FORMAT, EVENT_DATE = range(3)
+
+async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = date.today().isoformat()
+    res = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_EVENTS_DB_ID}/query",
+        headers=NOTION_HEADERS,
+        json={
+            "filter": {"property": "Дата", "date": {"on_or_after": today}},
+            "sorts": [{"property": "Дата", "direction": "ascending"}]
+        }
+    )
+    events = res.json().get("results", [])
+
+    if not events:
+        text = "📅 Ближайших мероприятий нет.\n\n"
+    else:
+        text = "📅 *Ближайшие мероприятия:*\n\n"
+        for e in events:
+            props = e["properties"]
+            name = props["Название"]["title"][0]["plain_text"] if props["Название"]["title"] else "—"
+            fmt = props["Формат"]["select"]["name"] if props["Формат"]["select"] else "—"
+            d = props["Дата"]["date"]["start"] if props["Дата"]["date"] else "—"
+            try:
+                parts = d.split("-")
+                d_display = f"{parts[2]}.{parts[1]}.{parts[0]}" if len(parts) == 3 else d
+            except:
+                d_display = d
+            text += f"🎉 *{name}*\n   📆 {d_display} · {fmt}\n\n"
+
+    text += "Хочешь добавить новое мероприятие? Напиши /add_event"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def add_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🎉 Название мероприятия?",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return EVENT_NAME
+
+async def add_event_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["event_name"] = update.message.text.strip()
+    keyboard = [["Киносеанс", "Dj Set"], ["Дегустация"]]
+    await update.message.reply_text(
+        "🎭 Формат мероприятия?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+    return EVENT_FORMAT
+
+async def add_event_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["event_format"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📅 Дата мероприятия?\n(Например: 25.06.2026)",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return EVENT_DATE
+
+async def add_event_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        parts = text.split(".")
+        if len(parts) == 3:
+            iso_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        else:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ Неверный формат. Используй: 25.06.2026")
+        return EVENT_DATE
+
+    name = context.user_data["event_name"]
+    fmt = context.user_data["event_format"]
+
+    page_data = {
+        "parent": {"database_id": NOTION_EVENTS_DB_ID},
+        "properties": {
+            "Название": {"title": [{"text": {"content": name}}]},
+            "Формат": {"select": {"name": fmt}},
+            "Дата": {"date": {"start": iso_date}},
+        }
+    }
+    res = requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_data)
+
+    if res.status_code == 200:
+        await update.message.reply_text(
+            f"✅ Мероприятие создано!\n\n🎉 {name}\n🎭 {fmt}\n📅 {text}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        await update.message.reply_text("❌ Ошибка при создании.", reply_markup=ReplyKeyboardRemove())
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def add_event_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("🛑 Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
 async def post_init(application):
     global bot_app
     bot_app = application
@@ -483,10 +588,22 @@ async def post_init(application):
     scheduler.start()
     await check_reviews()
 
+add_event_conv = ConversationHandler(
+    entry_points=[CommandHandler("add_event", add_event_start)],
+    states={
+        EVENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_name)],
+        EVENT_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_format)],
+        EVENT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_date)],
+    },
+    fallbacks=[CommandHandler("cancel", add_event_cancel)],
+)
+
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("enps", enps))
 app.add_handler(CommandHandler("problems", problems))
 app.add_handler(CommandHandler("birthdays", birthdays_cmd))
 app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("events", events_cmd))
+app.add_handler(add_event_conv)
 app.run_polling()
