@@ -497,7 +497,7 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not events:
         text = "📅 Ближайших мероприятий нет.\n\n"
     else:
-        text = "📅 *Ближайшие мероприятия:*\n\n"
+        text = "📅 Ближайшие мероприятия:\n\n"
         for e in events:
             props = e["properties"]
             name = props["Название"]["title"][0]["plain_text"] if props["Название"]["title"] else "—"
@@ -508,10 +508,10 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 d_display = f"{parts[2]}.{parts[1]}.{parts[0]}" if len(parts) == 3 else d
             except:
                 d_display = d
-            text += f"🎉 *{name}*\n   📆 {d_display} · {fmt}\n\n"
+            text += f"🎉 {name}\n   📆 {d_display} · {fmt}\n\n"
 
     text += "Хочешь добавить новое мероприятие? Напиши /add_event"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 async def add_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
