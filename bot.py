@@ -146,7 +146,7 @@ def create_notion_problem(cols, worst_score, worst_cat, comment, visit_date):
             "Оценка гостя": {"number": worst_score},
             "Комментарий гостя": {"rich_text": [{"text": {"content": comment}}]},
             "Дата отзыва": {"date": {"start": visit_date}},
-            "Статус": {"select": {"name": "Новая"}}
+            "Статус": {"select": {"name": "Задачи"}}
         }
     }
     res = requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_data)
@@ -321,7 +321,7 @@ async def problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json={
             "filter": {
                 "or": [
-                    {"property": "Статус", "select": {"equals": "Новая"}},
+                    {"property": "Статус", "select": {"equals": "Задачи"}},
                     {"property": "Статус", "select": {"equals": "В работе"}}
                 ]
             },
@@ -342,7 +342,7 @@ async def problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = props["Статус"]["select"]["name"] if props["Статус"]["select"] else "—"
         deadline = props["Срок исполнения"]["date"]["start"] if props["Срок исполнения"]["date"] else "не указан"
         responsible = props["Ответственный"]["rich_text"][0]["plain_text"] if props["Ответственный"]["rich_text"] else "не назначен"
-        status_icon = "🔴" if status == "Новая" else "🟡"
+        status_icon = "🔴" if status == "Задачи" else "🟡"
         text += f"{status_icon} *{category}* — {score}/10\n   👤 {responsible} · 📅 {deadline}\n\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
